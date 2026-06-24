@@ -3,6 +3,7 @@ import torch
 import math
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+import time
 
 # Ensure you have a CUDA device available
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -64,3 +65,48 @@ o1 = pytorch_flash_attn2(q,k,v)
 # print("Next: ====================")
 # print(o1[:1,:1,:10, :10])
 assert torch.allclose(o, o1, atol=1e-3), "Outputs do not match"
+
+# Warmup (imp for hiding overhead latencies)
+for _ in range(10):
+    _ = naive_attention(q,k,v)
+    _ = pytorch_flash_attn2(q,k,v)
+torch.cuda.synchronize()
+
+# Simple Time Measurement
+start_time = time.perf_counter()
+naive_attention(q,k,v)
+torch.cuda.synchronize()
+end_time = time.perf_counter()
+naive_time = (end_time - start_time) * 1000
+
+start_time = time.perf_counter()
+pytorch_flash_attn2(q,k,v)
+torch.cuda.synchronize()
+end_time = time.perf_counter()
+flash_time = (end_time - start_time) * 1000
+
+print(f"Naive Attention Time: {naive_time:.3f} ms")
+print(f"Flash Attention Time: {flash_time:.3f} ms")
+
+# Pytorch profiling
+print("\nRunning PyTorch Profiler...")
+with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes = True,
+        with_stack=False,
+) as prof:
+    # Run Naive
+    with torch.profiler.record_function('## NAIVE_ATTENTION ##'):
+        naive_attention(q,k,v)
+
+    # Run FlashAttention
+    with torch.profiler.record_function('## FLASH_ATTENTION ##'):
+        pytorch_flash_attn2(q,k,v)
+
+# Analyze Results
+print("\n=== Profiler Results (Sorted by CUDA Time) ===")
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+
+# Export chrome trace
+prof.export_chrome_trace("flash_attn_profile_v2.2.json")
+print("\nTrace exported to 'flash_attn_profile_v2.2.json'")
