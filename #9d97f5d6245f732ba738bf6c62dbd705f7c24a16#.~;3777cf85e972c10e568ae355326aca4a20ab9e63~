@@ -23,13 +23,3 @@ My favorite starter repo (clean, commented): https://github.com/tspeterkim/flash
 
 * Phase 2 (Rent Blackwell B200 on Cloud)
 Test your Phase 1 kernel, then add Blackwell goodies: TMA loads (cuda::memcpy_async), warp specialization, FP8 GEMM.
-
-
-* Notes (Jul 21)
-- Wrote custom Flash V1 in cuda
-- Compared the latency or time taken to run naive vs. pytorch's flash v2 vs custom v1 on batch_size = 16, seq_len = 1024, emb_dim = 256, num_heads = 8
-  Initial Results:
-  Naive Attention Time: 7.615 ms
-  Flash Attention Time: 0.929 ms
-  Custom Flash v1 Kernel Time: 63.103 ms
-- Profiled the custom v1 kernel to find the huge latency
