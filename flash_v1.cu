@@ -2,6 +2,7 @@
 #include <cmath>
 #include <stdio.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <torch/extension.h>
 
 __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *V,
@@ -33,17 +34,23 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
   for (int j = 0; j < Tc; j++) {
 
     // 1. Collective parallel loading of Kj, Vj to SRAM
-    for (int x = tx; x < Bc * d; x += Br) {
-        int row = x / d;
-        int col = x % d;
+    for (int x = tx; x < (Bc * d) / 8; x += Br) {
+        int offset = x * 8;
+        int row = offset / d;
+        int col = offset % d;
         int k_v_row_idx = j * Bc + row;
 
         if (k_v_row_idx < N) {
-            Kj[x] = K[bh_offset + k_v_row_idx * d + col];
-            Vj[x] = V[bh_offset + k_v_row_idx * d + col];
+          // Each vectorized float4 loads 4 FP32 values, for __half FP16, it loads 8
+            float4 k_val = *reinterpret_cast<const float4*>(&K[bh_offset + k_v_row_idx * d + col]);
+            float4 v_val = *reinterpret_cast<const float4*>(&V[bh_offset + k_v_row_idx * d + col]);
+            reinterpret_cast<float4*>(Kj)[x] = k_val;
+            reinterpret_cast<float4*>(Vj)[x] = v_val;
         } else {
-            Kj[x] = __float2half(0.0f);
-            Vj[x] = __float2half(0.0f);
+          // while make_float4 take four arguments(coz it works on FP32), it correctly sets
+          // the entire 128-bit (4*32) memory block to zero, which covers 8 __half elements
+            reinterpret_cast<float4*>(Kj)[x] = make_float4(0,0,0,0);
+            reinterpret_cast<float4*>(Vj)[x] = make_float4(0,0,0,0);
         }
     }
     __syncthreads();
@@ -54,12 +61,15 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
 
       // 2. Load Qi, Oi to SRAM, l and m to shared memory tracking arrays
       if (q_row_idx < N) {
-        for (int x = 0; x < d; x++) {
-            Qi[(tx * d) + x] = Q[bh_offset + q_row_idx * d + x];
+        for (int x = 0; x < d / 8; x++) {
+            float4 q_val = *reinterpret_cast<const float4*>(&Q[bh_offset + q_row_idx * d + x * 8]);
+            reinterpret_cast<float4*>(Qi)[(tx * d / 8) + x] = q_val;
+            
             if (j == 0) {
-                Oi[tx * d + x] = __float2half(0.0f);
+                reinterpret_cast<float4*>(Oi)[(tx * d / 8) + x] = make_float4(0,0,0,0);
             } else {
-                Oi[tx * d + x] = O[bh_offset + q_row_idx * d + x];
+                float4 o_val = *reinterpret_cast<const float4*>(&O[bh_offset + q_row_idx * d + x * 8]);
+                reinterpret_cast<float4*>(Oi)[(tx * d / 8) + x] = o_val;
             }
         }
         if (j == 0) {
@@ -80,12 +90,14 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
         float row_m_new = row_m_prev;
         float S_row[64]; // Static buffer tracking current max block matrix rows
 
+        #pragma unroll
         for (int col_k = 0; col_k < Bc; ++col_k) {
             int k_global_row = j * Bc + col_k;
             float score = 0.0f;
 
             if (k_global_row < N) {
                 // Accumulate in FP32 for statistical stability
+                #pragma unroll
                 for (int k = 0; k < d; ++k) {
                     score += __half2float(Qi[tx * d + k]) * __half2float(Kj[col_k * d + k]);
                 }
@@ -111,8 +123,10 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
         row_l_new = (alpha * row_l_prev) + row_l_new;
 
         // 4. Update Output tile
+        #pragma unroll
         for (int col_v = 0; col_v < d; ++col_v) {
             float pv_sum = 0.0f;
+            #pragma unroll
             for (int col_k = 0; col_k < Bc; ++col_k) {
                 pv_sum += S_row[col_k] * __half2float(Vj[col_k * d + col_v]);
             }
@@ -125,8 +139,9 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
         li[tx] = row_l_new;
 
         // Write back updated row to Global Memory (HBM)
-        for (int col = 0; col < d; ++col) {
-            O[bh_offset + q_row_idx * d + col] = Oi[tx * d + col];
+        for (int col_v_8 = 0; col_v_8 < d / 8; ++col_v_8) {
+            reinterpret_cast<float4*>(&O[bh_offset + q_row_idx * d + col_v_8 * 8])[0] = 
+                reinterpret_cast<float4*>(Oi)[tx * (d / 8) + col_v_8];
         }
         m[stats_offset + q_row_idx] = row_m_new;
         l[stats_offset + q_row_idx] = row_l_new;
@@ -152,11 +167,12 @@ torch::Tensor flash_attn_kernel(torch::Tensor Q, torch::Tensor K, torch::Tensor 
   int num_heads = Q.size(1);
   int seq_len = Q.size(2);
   int head_dim = Q.size(3);
+  TORCH_CHECK(head_dim % 8 == 0, "head_dim must be a multiple of 8 for vectorized loads");
 
   int max_sram_size;
   cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
 
-  int Br = 32;
+  int Br = 128;
   int Bc = 32;
 
   auto O = torch::zeros_like(Q);
