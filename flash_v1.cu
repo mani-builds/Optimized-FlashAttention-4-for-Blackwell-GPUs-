@@ -10,6 +10,7 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
                                 int Br, int Bc, int Tr, int Tc, float scale,
                                 __half *O, float *l, float *m) {
 
+  // Map threads
   int batch = blockIdx.x;
   int head = blockIdx.y;
   int tx = threadIdx.x;

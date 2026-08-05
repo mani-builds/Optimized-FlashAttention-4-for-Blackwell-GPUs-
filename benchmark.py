@@ -108,17 +108,17 @@ for _ in range(10):
 torch.cuda.synchronize()
 
 # Simple Time Measurement
-# start_time = time.perf_counter()
-# naive_attention(q,k,v)
-# torch.cuda.synchronize()
-# end_time = time.perf_counter()
-# naive_time = (end_time - start_time) * 1000
+start_time = time.perf_counter()
+naive_attention(q,k,v)
+torch.cuda.synchronize()
+end_time = time.perf_counter()
+naive_time = (end_time - start_time) * 1000
 
-# start_time = time.perf_counter()
-# pytorch_flash_attn2(q,k,v)
-# torch.cuda.synchronize()
-# end_time = time.perf_counter()
-# flash_time = (end_time - start_time) * 1000
+start_time = time.perf_counter()
+pytorch_flash_attn2(q,k,v)
+torch.cuda.synchronize()
+end_time = time.perf_counter()
+flash_time = (end_time - start_time) * 1000
 
 start_time = time.perf_counter()
 flash_v1_kernel(q,k,v)
@@ -126,8 +126,8 @@ torch.cuda.synchronize()
 end_time = time.perf_counter()
 custom_v1_time = (end_time - start_time) * 1000
 
-# print(f"Naive Attention Time: {naive_time:.3f} ms")
-# print(f"Flash Attention Time: {flash_time:.3f} ms")
+print(f"Naive Attention Time: {naive_time:.3f} ms")
+print(f"Flash Attention Time: {flash_time:.3f} ms")
 print(f"Custom Flash v1 Kernel Time: {custom_v1_time:.3f} ms")
 
 # # Pytorch profiling
