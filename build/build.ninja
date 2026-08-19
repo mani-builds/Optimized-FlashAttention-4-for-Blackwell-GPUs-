@@ -27,12 +27,12 @@ rule cuda_compile
 rule link
   command = $cxx $in $ldflags -o $out
 
-build flash_v1.cuda.o: cuda_compile /home/mani/gpu/flash_attention_project/flash_v1.cu
+build flash_v2_mma.cuda.o: cuda_compile /home/mani/gpu/flash_attention_project/flash_v2_mma.cu
 
 
 
 
 
-build flash_pytorch_extension.so: link flash_v1.cuda.o
+build flash_pytorch_extension.so: link flash_v2_mma.cuda.o
 
 default flash_pytorch_extension.so

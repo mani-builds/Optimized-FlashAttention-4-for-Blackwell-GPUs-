@@ -8,7 +8,7 @@
 __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *V,
                                 int B, int H, int N, int d,
                                 int Br, int Bc, int Tr, int Tc, float scale,
-                                __half *O, float *l, float *m) {
+                                __half *O) {
 
   // Map threads
   int batch = blockIdx.x;
@@ -16,7 +16,6 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
   int tx = threadIdx.x;
 
   int bh_offset = (batch * H + head) * N * d;
-  int stats_offset = (batch * H + head) * N;
 
   // Shared memory partitioning (Note: Shared memory dynamically allocated as bytes)
   extern __shared__ float sram[];
@@ -29,18 +28,16 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
   float *li = (float*)(Vj + (Bc * d));        // Size: Br * sizeof(float)
   float *mi = li + Br;                        // Size: Br * sizeof(float)
 
-  __half h_scale = __float2half(scale);
-
-  // Outer loop: Iterate over Q and O tiles
+  // Outer loop: Iterate over Q and O tiles (query blocks)
   for (int i = 0; i < Tr; i++) {
     int q_row_idx = i * Br + tx;
 
-    // 1. Load Qi into SRAM once; initialize Oi, li, mi (stay resident across all j)
+    // 1. Load Qi into SRAM once; initialize Oi=0, li=0, mi=-inf on-chip
     if (q_row_idx < N) {
       for (int x = 0; x < d / 8; x++) {
-          float4 q_val = *reinterpret_cast<const float4*>(&Q[bh_offset + q_row_idx * d + x * 8]);
-          reinterpret_cast<float4*>(Qi)[(tx * d / 8) + x] = q_val;
-          reinterpret_cast<float4*>(Oi)[(tx * d / 8) + x] = make_float4(0,0,0,0);
+        float4 q_val = *reinterpret_cast<const float4*>(&Q[bh_offset + q_row_idx * d + x * 8]);
+        reinterpret_cast<float4*>(Qi)[(tx * d / 8) + x] = q_val;
+        reinterpret_cast<float4*>(Oi)[(tx * d / 8) + x] = make_float4(0,0,0,0);
       }
       mi[tx] = -INFINITY;
       li[tx] = 0.0f;
@@ -52,23 +49,23 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
 
       // 2. Collective parallel loading of Kj, Vj to SRAM
       for (int x = tx; x < (Bc * d) / 8; x += Br) {
-          int offset = x * 8;
-          int row = offset / d;
-          int col = offset % d;
-          int k_v_row_idx = j * Bc + row;
+        int offset = x * 8;
+        int row = offset / d;
+        int col = offset % d;
+        int k_v_row_idx = j * Bc + row;
 
-          if (k_v_row_idx < N) {
-            // Each vectorized float4 loads 4 FP32 values, for __half FP16, it loads 8
-              float4 k_val = *reinterpret_cast<const float4*>(&K[bh_offset + k_v_row_idx * d + col]);
-              float4 v_val = *reinterpret_cast<const float4*>(&V[bh_offset + k_v_row_idx * d + col]);
-              reinterpret_cast<float4*>(Kj)[x] = k_val;
-              reinterpret_cast<float4*>(Vj)[x] = v_val;
-          } else {
-            // while make_float4 take four arguments(coz it works on FP32), it correctly sets
-            // the entire 128-bit (4*32) memory block to zero, which covers 8 __half elements
-              reinterpret_cast<float4*>(Kj)[x] = make_float4(0,0,0,0);
-              reinterpret_cast<float4*>(Vj)[x] = make_float4(0,0,0,0);
-          }
+        if (k_v_row_idx < N) {
+          // Each vectorized float4 loads 4 FP32 values, for __half FP16, it loads 8
+          float4 k_val = *reinterpret_cast<const float4*>(&K[bh_offset + k_v_row_idx * d + col]);
+          float4 v_val = *reinterpret_cast<const float4*>(&V[bh_offset + k_v_row_idx * d + col]);
+          reinterpret_cast<float4*>(Kj)[x] = k_val;
+          reinterpret_cast<float4*>(Vj)[x] = v_val;
+        } else {
+          // while make_float4 take four arguments(coz it works on FP32), it correctly sets
+          // the entire 128-bit (4*32) memory block to zero, which covers 8 __half elements
+          reinterpret_cast<float4*>(Kj)[x] = make_float4(0,0,0,0);
+          reinterpret_cast<float4*>(Vj)[x] = make_float4(0,0,0,0);
+        }
       }
       __syncthreads();
 
@@ -110,9 +107,10 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
             }
         }
         float alpha = expf(row_m_prev - row_m_new);
-        row_l_new = (alpha * row_l_prev) + row_l_new;
 
-        // 4. Update Output tile (SRAM-resident, normalized online)
+        // 4. FlashAttention-v2 update: accumulate O UNNORMALIZED (raw running
+        //    sum), rescaling by alpha only once per block. The final division
+        //    O = O / l happens once, after the K/V loop completes.
         #pragma unroll
         for (int col_v = 0; col_v < d; ++col_v) {
             float pv_sum = 0.0f;
@@ -121,24 +119,26 @@ __global__ void fwd_kernel_half(const __half *Q, const __half *K, const __half *
                 pv_sum += S_row[col_k] * __half2float(Vj[col_k * d + col_v]);
             }
 
-            float updated_val = (alpha * row_l_prev * __half2float(Oi[tx * d + col_v]) + pv_sum)/row_l_new;
-            Oi[tx * d + col_v] = __float2half(updated_val);
+            float acc = (alpha * __half2float(Oi[tx * d + col_v])) + pv_sum;
+            Oi[tx * d + col_v] = __float2half(acc);
         }
 
+        li[tx] = (alpha * row_l_prev) + row_l_new;
         mi[tx] = row_m_new;
-        li[tx] = row_l_new;
       }
       __syncthreads();
     }
 
-    // 5. Write back final row to Global Memory (HBM) once
+    // 5. Single final normalization O = O / l, then write back to HBM once
     if (q_row_idx < N) {
-      for (int col_v_8 = 0; col_v_8 < d / 8; ++col_v_8) {
-          reinterpret_cast<float4*>(&O[bh_offset + q_row_idx * d + col_v_8 * 8])[0] =
-              reinterpret_cast<float4*>(Oi)[tx * (d / 8) + col_v_8];
+      float row_l_final = li[tx];
+      for (int col_v = 0; col_v < d; ++col_v) {
+        Oi[tx * d + col_v] = __float2half(__half2float(Oi[tx * d + col_v]) / row_l_final);
       }
-      m[stats_offset + q_row_idx] = mi[tx];
-      l[stats_offset + q_row_idx] = li[tx];
+      for (int col_v_8 = 0; col_v_8 < d / 8; ++col_v_8) {
+        reinterpret_cast<float4*>(&O[bh_offset + q_row_idx * d + col_v_8 * 8])[0] =
+            reinterpret_cast<float4*>(Oi)[tx * (d / 8) + col_v_8];
+      }
     }
   }
 }
@@ -149,7 +149,7 @@ torch::Tensor flash_attn_kernel(torch::Tensor Q, torch::Tensor K, torch::Tensor 
   TORCH_CHECK(Q.sizes() == K.sizes() && Q.sizes() == V.sizes(), "Q, K, V shapes must match");
 
   // Adjusted Type Check: expect float16 / Half precision
-  TORCH_CHECK(Q.scalar_type() == torch::kFloat16, "flash_attn_V1 expects float16 inputs");
+  TORCH_CHECK(Q.scalar_type() == torch::kFloat16, "flash_attn_V2 expects float16 inputs");
 
   Q = Q.contiguous();
   K = K.contiguous();
@@ -168,10 +168,6 @@ torch::Tensor flash_attn_kernel(torch::Tensor Q, torch::Tensor K, torch::Tensor 
   int Bc = 32;
 
   auto O = torch::zeros_like(Q);
-
-  // Note: l and m statistics track row-level exponentials and must remain FP32 to prevent catastrophic underflow/overflow
-  auto l = torch::zeros({batch, num_heads, seq_len}, Q.options().dtype(torch::kFloat32));
-  auto m = torch::full({batch, num_heads, seq_len}, -INFINITY, Q.options().dtype(torch::kFloat32));
 
   int Tr = (seq_len + Br - 1) / Br;
   int Tc = (seq_len + Bc - 1) / Bc;
@@ -200,13 +196,11 @@ torch::Tensor flash_attn_kernel(torch::Tensor Q, torch::Tensor K, torch::Tensor 
         reinterpret_cast<__half *>(V.data_ptr<at::Half>()),
         batch, num_heads, seq_len, head_dim, Br, Bc, Tr, Tc,
         softmax_scale,
-        reinterpret_cast<__half *>(O.data_ptr<at::Half>()),
-        l.data_ptr<float>(),
-        m.data_ptr<float>());
+        reinterpret_cast<__half *>(O.data_ptr<at::Half>()));
 
   return O;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-   m.def("flash_attn_v1", &flash_attn_kernel, "Flash Attention v1 in CUDA (Float16)");
+   m.def("flash_attn_v2", &flash_attn_kernel, "Flash Attention V2 in CUDA (Float16)");
 }

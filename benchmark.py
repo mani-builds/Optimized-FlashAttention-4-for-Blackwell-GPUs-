@@ -61,21 +61,21 @@ def pytorch_flash_attn2(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
 
     return O
 
-def flash_v1_kernel(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
+def flash_v2_mma_kernel(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
                         ) -> torch.Tensor:
-    # CUdA Flash Kernel (flash_v1.cu)
+    # CUdA Flash Kernel (flash_v2_mma.cu)
     build_dir = os.path.join(os.getcwd(), 'build')
     os.makedirs(build_dir, exist_ok=True)
     kernel = cpp_extension.load(
         name = "flash_pytorch_extension",
-        sources = ["flash_v1.cu"],
+        sources = ["flash_v2_mma.cu"],
         extra_cflags=['-O3', '-g'],
         extra_include_paths=[pybind11.get_include()],
         build_directory=os.path.join(os.getcwd(), 'build'),
         verbose = True
     )
 
-    O = kernel.flash_attn_v1(Q, K, V)
+    O = kernel.flash_attn_v2_mma(Q, K, V)
     return O
 
 
@@ -93,7 +93,7 @@ o1 = pytorch_flash_attn2(q,k,v)
 # torch.cuda.synchronize()
 assert torch.allclose(o, o1, atol=1e-2), "Naive and Pytorch Outputs do not match"
 
-o2 = flash_v1_kernel(q,k,v)
+o2 = flash_v2_mma_kernel(q,k,v)
 # print(o2[:1,:1,:10, :10])
 # print(type(o2))
 assert torch.allclose(o1, o2, atol=1e-2), "Pytorch and CUdA kernel outputs do not match"
@@ -104,7 +104,7 @@ assert torch.allclose(o1, o2, atol=1e-2), "Pytorch and CUdA kernel outputs do no
 for _ in range(10):
     _ = naive_attention(q,k,v)
     _ = pytorch_flash_attn2(q,k,v)
-    _ = flash_v1_kernel(q,k,v)
+    _ = flash_v2_mma_kernel(q,k,v)
 torch.cuda.synchronize()
 
 # Simple Time Measurement
@@ -121,14 +121,14 @@ end_time = time.perf_counter()
 flash_time = (end_time - start_time) * 1000
 
 start_time = time.perf_counter()
-flash_v1_kernel(q,k,v)
+flash_v2_mma_kernel(q,k,v)
 torch.cuda.synchronize()
 end_time = time.perf_counter()
-custom_v1_time = (end_time - start_time) * 1000
+custom_v2_time = (end_time - start_time) * 1000
 
 print(f"Naive Attention Time: {naive_time:.3f} ms")
 print(f"Flash Attention Time: {flash_time:.3f} ms")
-print(f"Custom Flash v1 Kernel Time: {custom_v1_time:.3f} ms")
+print(f"Custom Flash v2 wmma Kernel Time: {custom_v2_time:.3f} ms")
 
 # # Pytorch profiling
 # print("\nRunning PyTorch Profiler...")
@@ -145,9 +145,9 @@ print(f"Custom Flash v1 Kernel Time: {custom_v1_time:.3f} ms")
 #     with torch.profiler.record_function('## FLASH_ATTENTION ##'):
 #         pytorch_flash_attn2(q,k,v)
 
-#     # Run Custom CUDA flash v1
-#     with torch.profiler.record_function('## Custom CUDA V1 ##'):
-#         flash_v1_kernel(q,k,v)
+#     # Run Custom CUDA flash v2
+#     with torch.profiler.record_function('## Custom CUDA V2 ##'):
+#         flash_v2_mma_kernel(q,k,v)
 
 # # Analyze Results
 # print("\n=== Profiler Results (Sorted by CUdA Time) ===")
